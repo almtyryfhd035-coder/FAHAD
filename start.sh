@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # start.sh - start script for FAHAD bot (venv-enabled)
 # This version creates a temporary virtualenv to run pip as non-root and avoid pip warnings.
-# It installs minimal deps into the venv (non-fatal if fails), then execs the bot with the venv Python.
+# If AUTO_DOWNLOAD=true it will also install transformers/torch in the venv before starting the bot
+# so the model generation from transformers can be used (may take time and bandwidth).
 
 set -e
 
@@ -24,6 +25,15 @@ fi
 
 echo "تثبيت الحزم الأساسية داخل البيئة (إن أمكن) — لن يمنع التشغيل إذا فشل التثبيت"
 pip install --no-cache-dir aiohttp discord.py || true
+
+# If AUTO_DOWNLOAD is true, try to install transformers & torch in the venv to enable local generation.
+if [ "${AUTO_DOWNLOAD}" = "true" ] || [ "${AUTO_DOWNLOAD}" = "1" ]; then
+  echo "AUTO_DOWNLOAD مفعل: محاولة تثبيت مكتبات transformers و torch (قد تستغرق وقتاً ومساحة)..."
+  # Install transformers and friends; allow failure so bot still starts
+  pip install --no-cache-dir transformers accelerate safetensors huggingface-hub || true
+  # Install CPU-only torch wheel (non-fatal). Use PyTorch CPU index to avoid GPU wheels.
+  pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu || true
+fi
 
 echo "تشغيل البوت..."
 # Use exec so signals are forwarded properly to the Python process
