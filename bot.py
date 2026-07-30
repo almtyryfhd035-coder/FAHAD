@@ -1,4 +1,4 @@
-# Discord AI Bot using Hugging Face Inference API
+# Discord AI Bot with optional Hugging Face Inference API and local fallback responses
 # bot.py
 import os
 import re
@@ -6,6 +6,7 @@ import asyncio
 import json
 from aiohttp import web, ClientSession
 import discord
+import random
 
 # Read config from environment
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -28,10 +29,52 @@ PROMPT_SYSTEM = (
     "لا تطلب من المستخدم أي مفاتيح أو معلومات حساسة.\n"
 )
 
+# Simple local fallback responder (when HF_API_TOKEN not provided)
+FALLBACK_TEMPLATES = [
+    "أبد، فهمت عليك. {ans}",
+    "أها، طيب: {ans}",
+    "أكيد، هذا اللي أقدر أقول: {ans}",
+    "يا هلا، {ans}",
+]
+
+def local_fallback_response(user_text: str) -> str:
+    """Generate a simple Saudi-dialect style reply based on heuristics.
+    This is intentionally lightweight so you only need the Discord bot token to run.
+    """
+    txt = user_text.lower()
+    # greetings
+    if re.search(r"\b(هلا|هلابا|هلا|يا هلا|يا هلا فيك|مرحبا|مراحب)\b", txt):
+        ans = random.choice(["يا هلا والله، وش تبي؟", "هلا، كيف أقدر أساعدك؟", "ياهلا، ابشر اخبرني."])
+        return ans
+
+    # thanks
+    if re.search(r"\b(شكرا|مشكور|جزاك|تسلم)\b", txt):
+        return random.choice(["العفو، في خدمتك!", "حياك، أي شي ثاني؟", "لا شكر على واجب."])
+
+    # asking for help or how-to
+    if re.search(r"\b(كيف|شلون|وشلون|شلون اسوي|كيف اسوي|وش اسوي)\b", txt):
+        ans = "لو تشرح لي بالضبط وش تبغى أسويلك أعطيك خطوات بسيطة." 
+        return random.choice(FALLBACK_TEMPLATES).format(ans=ans)
+
+    # price/time/where
+    if re.search(r"\b(كم|متى|وين|وينه|وين موقع)\b", txt):
+        ans = "أعطني تفاصيل أكثر، وبرد عليك بنفس اللهجة وبسرعة." 
+        return random.choice(FALLBACK_TEMPLATES).format(ans=ans)
+
+    # default short helpful reply
+    generic = random.choice([
+        "أقدر أساعدك بهالموضوع، عطِني تفاصيل أكثر.",
+        "معلومة حلوة، لكن بحاجة توضيح أكثر علشان أرد بدقة.",
+        "أأ، فهمت بشكل عام، تبي أمثلة ولا حل خطوة بخطوة؟",
+    ])
+    return random.choice(FALLBACK_TEMPLATES).format(ans=generic)
+
 async def call_hf_api(prompt: str) -> str:
-    """استدعي نموذج Hugging Face Inference API وأرجع النص الناتج"""
+    """استدعي نموذج Hugging Face Inference API وأرجع النص الناتج.
+    If HF_API_TOKEN is missing, return a message to indicate fallback should be used.
+    """
     if not HF_API_TOKEN:
-        return "خطأ: HF_API_TOKEN غير مفعّل. ضع توكن Hugging Face في متغير البيئة HF_API_TOKEN."
+        return None
 
     url = f"https://api-inference.huggingface.co/models/{MODEL_NAME}"
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Accept": "application/json"}
@@ -41,23 +84,19 @@ async def call_hf_api(prompt: str) -> str:
         async with ClientSession() as session:
             async with session.post(url, headers=headers, json=payload, timeout=120) as resp:
                 text = await resp.text()
-                # Try to parse JSON response
                 try:
                     data = json.loads(text)
                 except Exception:
                     return f"خطأ في استجابة الـ API: {text}"
 
-                # Common HF Inference return shapes: {'error': ...} or [{'generated_text': '...'}]
                 if isinstance(data, dict) and data.get("error"):
                     return f"خطأ من Hugging Face: {data.get('error')}"
                 if isinstance(data, list) and len(data) > 0:
                     first = data[0]
                     if isinstance(first, dict) and "generated_text" in first:
                         return first["generated_text"]
-                    # Some models return text directly
                     if isinstance(first, str):
                         return first
-                # fallback: string-repr
                 return str(data)
     except asyncio.TimeoutError:
         return "انتهت مهلة الاتصال بمزود الخدمة. جرّب لاحقاً."
@@ -66,9 +105,7 @@ async def call_hf_api(prompt: str) -> str:
 
 
 def strip_mention(content: str, bot_user: discord.User) -> str:
-    # Remove mention strings like <@!id> or @BotName
     content = re.sub(rf"<@!?{bot_user.id}>", "", content)
-    # Also strip bot name if present
     content = content.replace(bot_user.name, "")
     return content.strip()
 
@@ -85,17 +122,22 @@ async def on_message(message: discord.Message):
 
     # Only respond when bot is mentioned
     if client.user in message.mentions:
-        # prepare the user message (strip mention)
         user_text = strip_mention(message.content, client.user)
         if not user_text:
             await message.channel.send("ها؟ كيف أقدر أخدمك؟ اكتب سؤالك بعد المنشن.")
             return
 
-        prompt = PROMPT_SYSTEM + "\n" + f"المستخدم: {user_text}\nالمساعد:"  
-        # Indicate typing
+        prompt = PROMPT_SYSTEM + "\n" + f"المستخدم: {user_text}\nالمساعد:"
         async with message.channel.typing():
-            reply = await call_hf_api(prompt)
-            # Ensure reply length under discord limit
+            # Try HF if token present, otherwise use local fallback
+            reply = None
+            if HF_API_TOKEN:
+                reply = await call_hf_api(prompt)
+
+            if not reply:
+                # local fallback
+                reply = local_fallback_response(user_text)
+
             if len(reply) > 1900:
                 reply = reply[:1900] + "..."
             try:
@@ -104,7 +146,6 @@ async def on_message(message: discord.Message):
                 await message.channel.send(reply)
 
 async def start_webserver():
-    # Simple health endpoint so Render considers service healthy
     async def handle(request):
         return web.Response(text="OK")
 
@@ -119,7 +160,6 @@ async def start_webserver():
 
 
 async def main():
-    # run webserver and discord client concurrently
     await start_webserver()
     await client.start(DISCORD_BOT_TOKEN)
 
