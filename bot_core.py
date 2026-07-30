@@ -11,7 +11,8 @@ import asyncio
 
 # Config defaults (bot.py will set env vars; we read them here)
 MAX_DOWNLOAD_MB = int(os.getenv('MAX_DOWNLOAD_MB', '290'))
-MIN_MODEL_BYTES = int(os.getenv('MIN_MODEL_BYTES', str(10 * 1024 * 1024)))
+MIN_MODEL_bytes_env = os.getenv('MIN_MODEL_BYTES')
+MIN_MODEL_BYTES = int(MIN_MODEL_bytes_env) if MIN_MODEL_bytes_env else int(10 * 1024 * 1024)
 MODEL_NAME = os.getenv('MODEL_NAME', 'distilgpt2')
 LLAMA_CPP_BIN = os.getenv('LLAMA_CPP_BIN', './main')
 LLAMA_MODEL_PATH = os.getenv('LLAMA_MODEL_PATH', './models/auto_model.bin')
@@ -20,17 +21,43 @@ AUTO_DOWNLOAD = os.getenv('AUTO_DOWNLOAD', 'false').lower() in ('1','true','yes'
 # Simple local fallback reply (kept minimal to avoid duplication)
 import random
 CREATOR_REPLY = os.getenv('CREATOR_REPLY', 'فهد المطيري @w4px')
-AR_QUESTION_WORDS = ["وش", "شلون", "كيف", "ليش", "متى", "وين", "��ل", "لماذا", "كم"]
+AR_QUESTION_WORDS = ["وش", "شلون", "كيف", "ليش", "متى", "وين", "هل", "لماذا", "كم"]
 GREETINGS = ["هلا", "مرحبا", "أهلين", "سلام", "يا هلا"]
 THANKS = ["شكرا", "مشكور", "تسلم", "جزاك"]
 CODE_WORDS = ["بايثون", "python", "javascript", "js", "c++", "java", "كود", "دالة", "function", "class", "print("]
 
+async def _get_content_length(url: str, timeout_seconds: int = 30) -> int:
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                cl = resp.headers.get('Content-Length')
+                if cl and cl.isdigit():
+                    return int(cl)
+                return None
+    except Exception:
+        return None
+
 async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 20):
     """Download model to dest_path using a .part temporary file; enforce MAX_DOWNLOAD_MB and MIN_MODEL_BYTES.
+    Preflight: perform a HEAD request to check Content-Length and abort immediately if size > MAX_DOWNLOAD_MB.
     Returns True on success, False otherwise. Prints Arabic logs to stdout (bot.py expects that).
     """
     try:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        # Preflight check: try to get Content-Length before starting streaming
+        total_expected = await _get_content_length(url)
+        if total_expected is not None:
+            mb = total_expected / (1 << 20)
+            print(f"معلومات الملف: الحجم المُعلن = {int(mb)} ميجابايت", flush=True)
+            if total_expected > MAX_DOWNLOAD_MB * (1 << 20):
+                print(f"الملف أكبر من الحد المسموح ({MAX_DOWNLOAD_MB} ميجابايت). لن يتم تنزيله.", flush=True)
+                return False
+        else:
+            print("معلومات الملف: الحجم غير معروف (سيتم المحاولة مع مراقبة الحد أثناء التنزيل)", flush=True)
+
         timeout = aiohttp.ClientTimeout(total=60*60)  # 1 hour
         part_path = dest_path + '.part'
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -38,8 +65,16 @@ async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 2
                 if resp.status != 200:
                     print(f"فشل تنزيل النموذج، رمز HTTP: {resp.status}", flush=True)
                     return False
-                content_length = resp.headers.get('Content-Length')
-                total_expected = int(content_length) if content_length and content_length.isdigit() else None
+                # If preflight didn't know size, check header now
+                if total_expected is None:
+                    cl = resp.headers.get('Content-Length')
+                    if cl and cl.isdigit():
+                        total_expected = int(cl)
+                        mb = total_expected / (1 << 20)
+                        print(f"الحجم المتوقع بعد بدء الطلب = {int(mb)} ميجابايت", flush=True)
+                        if total_expected > MAX_DOWNLOAD_MB * (1 << 20):
+                            print(f"الملف أكبر من الحد المسموح ({MAX_DOWNLOAD_MB} ميجابايت) — إلغاء التنزيل.", flush=True)
+                            return False
                 print(f"بدء تنزيل النموذج... الحجم المتوقع: {total_expected if total_expected else 'غير معروف'}", flush=True)
                 with open(part_path, 'wb') as f:
                     downloaded = 0
@@ -50,6 +85,7 @@ async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 2
                         downloaded += len(chunk)
                         if downloaded % (10 * (1 << 20)) < chunk_size:
                             print(f"تم تنزيل {downloaded // (1<<20)} ميجابايت...", flush=True)
+                        # enforce maximum download size
                         if downloaded > MAX_DOWNLOAD_MB * (1 << 20):
                             print(f"تجاوز تحميل النموذج الحد المسموح ({MAX_DOWNLOAD_MB} ميجابايت) — سيتم إيقاف التنزيل لحماية المساحة.", flush=True)
                             try:
@@ -61,14 +97,16 @@ async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 2
                             except Exception:
                                 pass
                             return False
+                # After finishing, verify size if we know expected length
                 final_size = os.path.getsize(part_path)
                 if total_expected is not None and final_size != total_expected:
-                    print(f"حجم الملف النهائي ({final_size}) لا يطابق المحتوى المتوقع ({total_expected}) — سيتم إلغاء الملف.", flush=True)
+                    print(f"حجم الملف النهائي ({final_size}) لا يطابق المحتوى المتوقع ({total_expected}) — سيتم إلغاء الم��ف.", flush=True)
                     try:
                         os.remove(part_path)
                     except Exception:
                         pass
                     return False
+                # Accept file only if it's larger than minimum size
                 if final_size < MIN_MODEL_BYTES:
                     print(f"الملف الذي تم تنزيله صغير جداً ({final_size} بايت) — سيتم تجاهله.", flush=True)
                     try:
@@ -76,6 +114,7 @@ async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 2
                     except Exception:
                         pass
                     return False
+        # atomic rename
         os.replace(part_path, dest_path)
         print(f"اكتمل تنزيل النموذج وحُفظ في: {dest_path}", flush=True)
         return True
@@ -223,7 +262,7 @@ def local_ai_reply(text: str) -> str:
             return ("```python\ndef reverse_list(a):\n    return a[::-1]\n```")
         if 'javascript' in low or 'js' in low:
             return ("```javascript\nfunction reverseArray(a){\n  return a.slice().reverse();\n}\n```")
-        return "قل لي اللغة والمطلوب وسأعطيك كود جاهز مع شرح."
+        return "قل لي اللغة والمطلوب ��سأعطيك كود جاهز مع شرح."
     if '?' in text or any(q in low for q in AR_QUESTION_WORDS):
         words = re.findall(r"[\w\u0621-\u064A]+", text)
         topic = ' '.join(words[:8])
