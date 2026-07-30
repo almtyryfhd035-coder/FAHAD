@@ -1,0 +1,12 @@
+# Render service configuration for FAHAD
+# You can also configure the service manually in Render dashboard.
+services:
+  - type: web
+    name: FAHAD
+    env: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    # You must set the following environment variables in the Render dashboard:
+    # DISCORD_BOT_TOKEN (required)
+    # HF_API_TOKEN (required) - Hugging Face API token
+    # MODEL_NAME (optional) - e.g., 'gpt2' or another model compatible with Inference API

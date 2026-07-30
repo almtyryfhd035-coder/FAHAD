@@ -1,0 +1,7 @@
+# Ignore Python artifacts
+__pycache__/
+*.pyc
+.env
+
+# Docker
+.dockerignore
