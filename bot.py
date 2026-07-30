@@ -1,17 +1,12 @@
 """
-FAHAD - Auto-download-capable bot
+FAHAD - Auto-download-capable bot (updated)
 
-Features added in this commit:
-- AUTO_DOWNLOAD mode: when AUTO_DOWNLOAD=true in env, the bot will attempt to install required packages (transformers and torch)
-  at runtime and download a specified small model (MODEL_NAME) from Hugging Face. This requires internet access and may take
-  time/resources during the first run. No manual downloads required from you.
-- The bot still keeps the lightweight Arabic fallback generator so it always responds even if the auto-download fails.
-- The bot attempts the auto-install/load lazily on the first message that requires model generation.
-
-Notes / warnings:
-- Installing torch/transformers at runtime can be slow and may fail on limited hosts (Render free tier). If it fails,
-  the bot falls back to the template-based generator and will continue responding.
-- For more reliable and faster downloads, set an HF_TOKEN in the environment (optional).
+Changes in this commit:
+- Suppress/strip progress-bar and "Loading weights" noise from llama.cpp subprocess output.
+- Silence transformers/from_pretrained verbose stdout/stderr using contextlib.redirect_stdout/stderr to avoid tqdm bars in logs.
+- Make model loading non-blocking during on_message: schedule background load (async task) so the bot falls back to local generator immediately instead of hanging.
+- Add clearer log messages for model load success/failure so you can see concise status in logs.
+- Improve error handling so bot continues to reply with the fallback generator if model isn't available.
 """
 
 import os
@@ -21,9 +16,11 @@ import json
 import time
 import subprocess
 import sys
+import traceback
 from aiohttp import web
 import discord
 import random
+import contextlib
 
 # Config
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -36,6 +33,11 @@ CHANNEL_COOLDOWN = float(os.getenv("CHANNEL_COOLDOWN", "0.2"))
 USER_COOLDOWN = float(os.getenv("USER_COOLDOWN", "0.1"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "8"))
 CREATOR_REPLY = os.getenv("CREATOR_REPLY", "فهد المطيري @w4px")
+
+# Model downloader settings (optional)
+MODEL_DOWNLOAD_URL = os.getenv('MODEL_DOWNLOAD_URL')
+LLAMA_CPP_BIN = os.getenv('LLAMA_CPP_BIN', './main')
+LLAMA_MODEL_PATH = os.getenv('LLAMA_MODEL_PATH', './models/auto_model.bin')
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN environment variable is required")
@@ -61,9 +63,37 @@ GREETINGS = ["هلا", "مرحبا", "أهلين", "سلام", "يا هلا"]
 THANKS = ["شكرا", "مشكور", "تسلم", "جزاك"]
 CODE_WORDS = ["بايثون", "python", "javascript", "js", "c++", "java", "كود", "دالة", "function", "class", "print("]
 
-# ---------- Dynamic installer & loader ----------
+# ---------- Model download helper ----------
+import aiohttp
+
+async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 20):
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        timeout = aiohttp.ClientTimeout(total=60*60)  # allow up to 1 hour
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"Model download failed, HTTP status: {resp.status}")
+                    return False
+                total = resp.headers.get('Content-Length')
+                print(f"Starting model download: {url} -> {dest_path} (size={total})")
+                with open(dest_path, 'wb') as f:
+                    downloaded = 0
+                    async for chunk in resp.content.iter_chunked(chunk_size):
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded % (10 * (1 << 20)) < chunk_size:
+                            print(f"Downloaded {downloaded} bytes...")
+        print("Model download completed")
+        return True
+    except Exception as e:
+        print("Exception during model download:", e)
+        return False
+
+# ---------- Dynamic installer & loader with suppressed verbosity ----------
 async def run_subprocess(cmd, timeout=900):
-    """Run subprocess asynchronously and stream output to logs."""
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await proc.communicate()
@@ -77,7 +107,6 @@ async def ensure_transformers_installed():
     global TRANSFORMERS_AVAILABLE
     if TRANSFORMERS_AVAILABLE:
         return True
-    # Try to import first
     try:
         import transformers  # noqa: F401
         import torch  # noqa: F401
@@ -86,13 +115,10 @@ async def ensure_transformers_installed():
     except Exception:
         pass
 
-    # If AUTO_DOWNLOAD disabled, skip
     if not AUTO_DOWNLOAD:
         return False
 
-    # Attempt to pip install transformers and torch
     print("AUTO_DOWNLOAD enabled: attempting to install transformers and torch. This may take several minutes...")
-    # Prefer installing a CPU-only torch wheel where available to reduce size; let pip choose the best
     cmds = [
         [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
         [sys.executable, "-m", "pip", "install", "transformers", "accelerate", "safetensors"],
@@ -101,12 +127,12 @@ async def ensure_transformers_installed():
     for cmd in cmds:
         code, output = await run_subprocess(cmd, timeout=1200)
         print('CMD:', ' '.join(cmd), 'RETURN:', code)
+        # Print truncated output to avoid huge logs
         print(output[:2000])
         if code != 0:
             print('One of the install steps failed; aborting automatic install.')
             return False
 
-    # Try import again
     try:
         import transformers  # noqa: F401
         import torch  # noqa: F401
@@ -117,39 +143,78 @@ async def ensure_transformers_installed():
         return False
 
 async def load_transformers_model():
-    """Lazy-load the small transformers model."""
     global MODEL, TOKENIZER, MODEL_DEVICE, MODEL_LOADING
     if MODEL is not None:
         return True
     if MODEL_LOADING:
-        # another coro is loading
         return False
     MODEL_LOADING = True
     ok = await ensure_transformers_installed()
     if not ok:
         MODEL_LOADING = False
+        print('Transformers not available or install failed')
         return False
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
-        print(f"Downloading model {MODEL_NAME} from Hugging Face (if not cached)...")
-        TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
-        MODEL = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-        if torch.cuda.is_available():
+        print(f"Downloading/loading model {MODEL_NAME} from Hugging Face (this may be quiet)...")
+        # suppress stdout/stderr (tqdm/progress bars)
+        devnull = open(os.devnull, 'w')
+        try:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
+                MODEL = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+        finally:
+            devnull.close()
+        if 'cuda' in str(getattr(MODEL, 'device', '')) or (hasattr(torch, 'cuda') and torch.cuda.is_available()):
             MODEL_DEVICE = 'cuda'
             MODEL.to('cuda')
         else:
             MODEL_DEVICE = 'cpu'
             MODEL.to('cpu')
         MODEL_LOADING = False
-        print('Model loaded successfully on', MODEL_DEVICE)
+        print('Model loaded successfully')
         return True
     except Exception as e:
-        print('Failed to load transformers model:', e)
         MODEL = None
         TOKENIZER = None
         MODEL_LOADING = False
+        print('Failed to load transformers model:', e)
+        traceback.print_exc()
         return False
+
+# ---------- llama.cpp integration (capture and filter progress output) ----------
+async def generate_with_llama_cpp_prompt(prompt: str, max_tokens: int = 256, temp: float = 0.7) -> str:
+    bin_path = LLAMA_CPP_BIN
+    model_path = LLAMA_MODEL_PATH
+    if not os.path.isfile(bin_path):
+        alt = os.path.join('llama.cpp', 'main')
+        if os.path.isfile(alt):
+            bin_path = alt
+        else:
+            return None
+    if not os.path.isfile(model_path):
+        return None
+
+    cmd = [bin_path, '-m', model_path, '--threads', '4', '--temp', str(temp), '--n_predict', str(max_tokens), '--prompt', prompt]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await proc.communicate()
+        text = stdout.decode(errors='ignore') if stdout else ''
+        # Filter out noisy progress lines like "Loading weights:" or percentage bars
+        lines = []
+        for ln in text.splitlines():
+            if re.search(r'Loading weights:|\d+%|\[[-= >]+\]', ln):
+                continue
+            lines.append(ln)
+        filtered_text = '\n'.join(lines).strip()
+        if prompt and filtered_text.startswith(prompt):
+            return filtered_text[len(prompt):].strip()
+        return filtered_text if filtered_text else None
+    except Exception as e:
+        print('Error running llama.cpp subprocess:', e)
+        traceback.print_exc()
+        return None
 
 # ---------- Simple local generator (fallback) ----------
 
@@ -192,7 +257,7 @@ def local_ai_reply(text: str) -> str:
         return f"ملخّص سريع: {first} ... {last}\nتبي تفصيل أو أمثلة؟"
     return "أقدر أساعدك — أعطني تفاصيل أكثر أو اطلب 'اشرح' أو 'اعطني كود'"
 
-# ---------- Simple transformers generation (if model loaded) ----------
+# ---------- Transformers generation helper ----------
 
 def generate_with_transformers(prompt: str, max_new_tokens: int = 128, temperature: float = 0.7) -> str:
     global MODEL, TOKENIZER, MODEL_DEVICE
@@ -210,6 +275,7 @@ def generate_with_transformers(prompt: str, max_new_tokens: int = 128, temperatu
         return text.strip()
     except Exception as e:
         print('Generation error:', e)
+        traceback.print_exc()
         return None
 
 # ---------- Discord events ----------
@@ -220,6 +286,26 @@ WHO_MADE_PATTERNS = [r"\bمن\s+صنعك\b", r"\bمن\s+سواك\b", r"\bمين\
 async def on_ready():
     print(f"Logged in as {client.user} (id: {client.user.id})")
     print(f"AUTO_DOWNLOAD={AUTO_DOWNLOAD}, MODEL_NAME={MODEL_NAME}, REPLY_ALL={REPLY_ALL}")
+    # If MODEL_DOWNLOAD_URL is set, attempt to download in background
+    if AUTO_DOWNLOAD and MODEL_DOWNLOAD_URL and not os.path.isfile(LLAMA_MODEL_PATH):
+        print('Scheduling background model download...')
+        asyncio.create_task(download_and_prepare_model())
+
+async def download_and_prepare_model():
+    # download model if URL provided
+    try:
+        if MODEL_DOWNLOAD_URL and not os.path.isfile(LLAMA_MODEL_PATH):
+            ok = await download_model_file(MODEL_DOWNLOAD_URL, LLAMA_MODEL_PATH)
+            if ok:
+                print('Downloaded ggml model to', LLAMA_MODEL_PATH)
+            else:
+                print('Model download failed or was incomplete')
+        # Do not block startup: schedule transformers load but don't await here
+        if AUTO_DOWNLOAD:
+            asyncio.create_task(load_transformers_model())
+    except Exception:
+        print('Error in download_and_prepare_model:')
+        traceback.print_exc()
 
 @client.event
 async def on_message(message: discord.Message):
@@ -240,7 +326,6 @@ async def on_message(message: discord.Message):
         if client.user in message.mentions:
             should_reply = True
         else:
-            # reply-to-bot
             if message.reference:
                 try:
                     ref = message.reference
@@ -277,25 +362,24 @@ async def on_message(message: discord.Message):
                     pass
             return
 
-    # Attempt to use transformers model if AUTO_DOWNLOAD enabled
+    # Attempt llama.cpp generation first if model present
     reply = None
-    if AUTO_DOWNLOAD:
-        # try to load model lazily (non-blocking load attempt)
-        if MODEL is None and not MODEL_LOADING:
-            # schedule model loading but don't block overly long in case of failure
-            # We load synchronously here to ensure we can use it for the current message if possible
-            loaded = await load_transformers_model()
-            if loaded:
-                # generate
-                prompt = f"المستخدم: {message.content}\nالمساعد:"
-                gen = generate_with_transformers(prompt, max_new_tokens=128, temperature=0.7)
-                if gen:
-                    reply = gen
-        elif MODEL is not None:
-            prompt = f"المستخدم: {message.content}\nالمساعد:"
-            gen = generate_with_transformers(prompt, max_new_tokens=128, temperature=0.7)
-            if gen:
-                reply = gen
+    if os.path.isfile(LLAMA_CPP_BIN) and os.path.isfile(LLAMA_MODEL_PATH):
+        gen = await generate_with_llama_cpp_prompt(build_prompt_for_model(message.content), max_tokens=256, temp=0.7)
+        if gen:
+            reply = gen
+
+    # Attempt transformers generation only if model is already loaded (don't await long loads here)
+    if not reply and MODEL is not None:
+        prompt = f"المستخدم: {message.content}\nالمساعد:"
+        gen = generate_with_transformers(prompt, max_new_tokens=128, temperature=0.7)
+        if gen:
+            reply = gen
+
+    # If model isn't ready and AUTO_DOWNLOAD is enabled, ensure background load is running
+    if not reply and AUTO_DOWNLOAD and MODEL is None and not MODEL_LOADING:
+        # schedule background load without blocking the reply
+        asyncio.create_task(load_transformers_model())
 
     # fallback to local generator
     if not reply:
@@ -314,6 +398,10 @@ async def on_message(message: discord.Message):
             last_reply_time_user[usr_id] = now
         except Exception:
             pass
+
+# Build a short system-like prompt for future use if needed
+def build_prompt_for_model(user_text: str) -> str:
+    return f"المستخدم: {user_text}\nالمساعد:"
 
 # Health server
 async def start_webserver():
@@ -336,3 +424,5 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Shutting down")
+    except Exception:
+        traceback.print_exc()
