@@ -1,12 +1,11 @@
 """
-FAHAD - Auto-download-capable bot (updated)
+FAHAD - Suppress HF warnings, Arabic logs for downloads, and HF token support guidance
 
-Changes in this commit:
-- Suppress/strip progress-bar and "Loading weights" noise from llama.cpp subprocess output.
-- Silence transformers/from_pretrained verbose stdout/stderr using contextlib.redirect_stdout/stderr to avoid tqdm bars in logs.
-- Make model loading non-blocking during on_message: schedule background load (async task) so the bot falls back to local generator immediately instead of hanging.
-- Add clearer log messages for model load success/failure so you can see concise status in logs.
-- Improve error handling so bot continues to reply with the fallback generator if model isn't available.
+Changes in this update:
+- Sets huggingface_hub logger to ERROR to mute HF progress/warnings.
+- Reads HF token env vars (HF_TOKEN, HF_API_TOKEN, HUGGINGFACE_HUB_TOKEN) and injects into environment for faster authenticated downloads.
+- Replaced key log messages about downloading/loading models with concise Arabic messages so Railway logs show meaningful Arabic lines (e.g., "بدء تنزيل النموذج...", "اكتمل تنزيل النموذج: <path>").
+- Kept robust fallback behavior: if download or load fails the bot continues responding with the Arabic fallback.
 """
 
 import os
@@ -21,6 +20,18 @@ from aiohttp import web
 import discord
 import random
 import contextlib
+import logging
+
+# Mute Hugging Face hub verbose logs (progress bars/warnings) and set level to ERROR
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+# If user provided any HF token variants, normalize them so HF libraries use them
+hf_token_env = os.getenv('HF_TOKEN') or os.getenv('HF_API_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN') or os.getenv('HF_API')
+if hf_token_env:
+    os.environ['HUGGINGFACE_HUB_TOKEN'] = hf_token_env
+    os.environ['HF_TOKEN'] = hf_token_env
+    os.environ['HF_API_TOKEN'] = hf_token_env
 
 # Config
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -63,7 +74,7 @@ GREETINGS = ["هلا", "مرحبا", "أهلين", "سلام", "يا هلا"]
 THANKS = ["شكرا", "مشكور", "تسلم", "جزاك"]
 CODE_WORDS = ["بايثون", "python", "javascript", "js", "c++", "java", "كود", "دالة", "function", "class", "print("]
 
-# ---------- Model download helper ----------
+# ---------- Model download helper (Arabic logging) ----------
 import aiohttp
 
 async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 20):
@@ -73,10 +84,10 @@ async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 2
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    print(f"Model download failed, HTTP status: {resp.status}")
+                    print(f"فشل تنزيل النموذج، رمز HTTP: {resp.status}")
                     return False
                 total = resp.headers.get('Content-Length')
-                print(f"Starting model download: {url} -> {dest_path} (size={total})")
+                print(f"بدء تنزيل النموذج... الحجم المتوقع: {total if total else 'غير معروف'}")
                 with open(dest_path, 'wb') as f:
                     downloaded = 0
                     async for chunk in resp.content.iter_chunked(chunk_size):
@@ -85,14 +96,14 @@ async def download_model_file(url: str, dest_path: str, chunk_size: int = 1 << 2
                         f.write(chunk)
                         downloaded += len(chunk)
                         if downloaded % (10 * (1 << 20)) < chunk_size:
-                            print(f"Downloaded {downloaded} bytes...")
-        print("Model download completed")
+                            print(f"تم تنزيل {downloaded // (1<<20)} ميجابايت...")
+        print(f"اكتمل تنزيل النموذج وحُفظ في: {dest_path}")
         return True
     except Exception as e:
-        print("Exception during model download:", e)
+        print("خطأ أثناء تنزيل النموذج:", e)
         return False
 
-# ---------- Dynamic installer & loader with suppressed verbosity ----------
+# ---------- Dynamic installer & loader with suppressed verbosity and Arabic logs ----------
 async def run_subprocess(cmd, timeout=900):
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -116,9 +127,10 @@ async def ensure_transformers_installed():
         pass
 
     if not AUTO_DOWNLOAD:
+        print("تنزيل تلقائي معطّل (AUTO_DOWNLOAD=false)")
         return False
 
-    print("AUTO_DOWNLOAD enabled: attempting to install transformers and torch. This may take several minutes...")
+    print("AUTO_DOWNLOAD مفعّل: جاري محاولة تثبيت مكتبات transformers و torch، قد يستغرق هذا عدة دقائق...")
     cmds = [
         [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
         [sys.executable, "-m", "pip", "install", "transformers", "accelerate", "safetensors"],
@@ -126,11 +138,10 @@ async def ensure_transformers_installed():
     ]
     for cmd in cmds:
         code, output = await run_subprocess(cmd, timeout=1200)
-        print('CMD:', ' '.join(cmd), 'RETURN:', code)
-        # Print truncated output to avoid huge logs
+        print('تشغيل الأمر:', ' '.join(cmd), 'النتيجة:', code)
         print(output[:2000])
         if code != 0:
-            print('One of the install steps failed; aborting automatic install.')
+            print('فشل أحد خطوات التثبيت؛ سيتم إيقاف المحاولة التلقائية.')
             return False
 
     try:
@@ -139,7 +150,7 @@ async def ensure_transformers_installed():
         TRANSFORMERS_AVAILABLE = True
         return True
     except Exception as e:
-        print('Import after install failed:', e)
+        print('فشل الاستيراد بعد التثبيت:', e)
         return False
 
 async def load_transformers_model():
@@ -152,12 +163,12 @@ async def load_transformers_model():
     ok = await ensure_transformers_installed()
     if not ok:
         MODEL_LOADING = False
-        print('Transformers not available or install failed')
+        print('مكتبات transformers غير متوفرة أو فشل التثبيت')
         return False
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
-        print(f"Downloading/loading model {MODEL_NAME} from Hugging Face (this may be quiet)...")
+        print(f"جاري تحميل/تنزيل النموذج {MODEL_NAME} من Hugging Face (ربما بدون طباعة تقدم)...")
         # suppress stdout/stderr (tqdm/progress bars)
         devnull = open(os.devnull, 'w')
         try:
@@ -173,17 +184,17 @@ async def load_transformers_model():
             MODEL_DEVICE = 'cpu'
             MODEL.to('cpu')
         MODEL_LOADING = False
-        print('Model loaded successfully')
+        print('اكتمل تحميل النموذج (transformers) بنجاح')
         return True
     except Exception as e:
         MODEL = None
         TOKENIZER = None
         MODEL_LOADING = False
-        print('Failed to load transformers model:', e)
+        print('فشل تحميل نموذج transformers:', e)
         traceback.print_exc()
         return False
 
-# ---------- llama.cpp integration (capture and filter progress output) ----------
+# ---------- llama.cpp integration (capture and filter progress output) with Arabic logs ----------
 async def generate_with_llama_cpp_prompt(prompt: str, max_tokens: int = 256, temp: float = 0.7) -> str:
     bin_path = LLAMA_CPP_BIN
     model_path = LLAMA_MODEL_PATH
@@ -192,8 +203,10 @@ async def generate_with_llama_cpp_prompt(prompt: str, max_tokens: int = 256, tem
         if os.path.isfile(alt):
             bin_path = alt
         else:
+            print('لم يتم العثور على ملف التنفيذ llama.cpp عند المسار المحدد')
             return None
     if not os.path.isfile(model_path):
+        print('ملف النموذج غير موجود في المسار:', model_path)
         return None
 
     cmd = [bin_path, '-m', model_path, '--threads', '4', '--temp', str(temp), '--n_predict', str(max_tokens), '--prompt', prompt]
@@ -212,7 +225,7 @@ async def generate_with_llama_cpp_prompt(prompt: str, max_tokens: int = 256, tem
             return filtered_text[len(prompt):].strip()
         return filtered_text if filtered_text else None
     except Exception as e:
-        print('Error running llama.cpp subprocess:', e)
+        print('خطأ أثناء تشغيل llama.cpp:', e)
         traceback.print_exc()
         return None
 
@@ -274,7 +287,7 @@ def generate_with_transformers(prompt: str, max_new_tokens: int = 128, temperatu
             return text[len(prompt):].strip()
         return text.strip()
     except Exception as e:
-        print('Generation error:', e)
+        print('خطأ أثناء توليد الرد من transformers:', e)
         traceback.print_exc()
         return None
 
@@ -284,11 +297,11 @@ WHO_MADE_PATTERNS = [r"\bمن\s+صنعك\b", r"\bمن\s+سواك\b", r"\bمين\
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user} (id: {client.user.id})")
+    print(f"تم تسجيل الدخول كبوت: {client.user} (id: {client.user.id})")
     print(f"AUTO_DOWNLOAD={AUTO_DOWNLOAD}, MODEL_NAME={MODEL_NAME}, REPLY_ALL={REPLY_ALL}")
     # If MODEL_DOWNLOAD_URL is set, attempt to download in background
     if AUTO_DOWNLOAD and MODEL_DOWNLOAD_URL and not os.path.isfile(LLAMA_MODEL_PATH):
-        print('Scheduling background model download...')
+        print('تم جدولة تنزيل النموذج في الخلفية...')
         asyncio.create_task(download_and_prepare_model())
 
 async def download_and_prepare_model():
@@ -297,14 +310,14 @@ async def download_and_prepare_model():
         if MODEL_DOWNLOAD_URL and not os.path.isfile(LLAMA_MODEL_PATH):
             ok = await download_model_file(MODEL_DOWNLOAD_URL, LLAMA_MODEL_PATH)
             if ok:
-                print('Downloaded ggml model to', LLAMA_MODEL_PATH)
+                print('تم تنزيل النموذج بنجاح إلى', LLAMA_MODEL_PATH)
             else:
-                print('Model download failed or was incomplete')
+                print('فشل تنزيل النموذج أو كان التنزيل غير مكتمل')
         # Do not block startup: schedule transformers load but don't await here
         if AUTO_DOWNLOAD:
             asyncio.create_task(load_transformers_model())
     except Exception:
-        print('Error in download_and_prepare_model:')
+        print('خطأ في عملية تنزيل النموذج:')
         traceback.print_exc()
 
 @client.event
@@ -413,7 +426,7 @@ async def start_webserver():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    print(f"Health server started on port {PORT}")
+    print(f"خادم الصحة شغّال على المنفذ {PORT}")
 
 async def main():
     await start_webserver()
@@ -423,6 +436,6 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Shutting down")
+        print("جارٍ إيقاف البوت")
     except Exception:
         traceback.print_exc()
