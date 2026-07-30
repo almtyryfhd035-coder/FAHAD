@@ -1,26 +1,30 @@
-# FAHAD - Discord AI Bot
+# README - Updated recommendation for programming model
 
-هذا المشروع يجهّز بوت دسكورد يستخدم واجهة Hugging Face Inference للردود باللغة العربية (اللهجة السعودية العامية).
+هذا التحديث يجهّز البوت ليشتغل مع نموذج برمجي قوي ومجاني (مفتوح المصدر) عبر Hugging Face Inference.
 
-المحتويات:
-- bot.py: كود البوت
-- Dockerfile: لبناء الصورة على Render
-- render.yaml: (اختياري) ملف إعداد خدمة Render
-- requirements.txt: تبعيات المشروع
+أفضل نموذج مجاني للبرمجة (موصى به):
+- bigcode/starcoder  (مناسب لكتابة وتصحيح الشيفرات)
 
-إعداد وتشغيل على Render (خطوات سريعة):
-1. ادخل إلى https://dashboard.render.com وابدأ خدمة جديدة (New -> Web Service).
-2. اختر GitHub ووصّل مستودع almtyryfhd035-coder/FAHAD.
-3. اختر Environment: Docker
-4. إذا طُلب Dockerfile path اتركه كما هو (Dockerfile).
-5. في Environment > Environment Variables أضف المتغيرات التالية:
-   - DISCORD_BOT_TOKEN = توكن البوت (احصل عليه من بوابة Discord Developer Portal)
-   - HF_API_TOKEN = توكن Hugging Face (من https://huggingface.co/settings/tokens)
-   - MODEL_NAME = اسم الموديل على Hugging Face (مثال: gpt2 أو موديل حواري أفضل إن وُجد)
-6. قم بنشر الخدمة.
+ملاحظات مهمة:
+- Hugging Face يوفر إمكانية إنشاء توكن مجاني (HF_API_TOKEN) من إعدادات الحساب. البوت يحتاج هذا التوكن عشان يستدعي النموذج من خلال Inference API.
+- استخدام النموذج المجاني قد يكون له حدود (rate limits) لكن عادة يكفي للاستخدام الأساسي.
 
-ملاحظات وأفضل الممارسات:
-- أنصح باستخدام موديل حوار مُصمّم للردود، وليس gpt2 الافتراضي؛ ابحث في Hugging Face عن نماذج دردشة متوافقة مع Inference API.
-- لا تُشارك مفاتيحك (DISCORD_BOT_TOKEN أو HF_API_TOKEN) في المحادثات العامة.
-- إن رغبت أن أضبط لك اسم الموديل الافتراضي أو أضيف تحسينات إضافية (تخزين سياق المحادثة، حدود الطول، فلترة)، أخبرني وأطبقها.
+خطوات سريعة للتشغيل على Render بعد التعديلات:
+1) في لوحة Render (اختَر خدمة FAHAD) أضف Environment Variables:
+   - DISCORD_BOT_TOKEN = <توكن بوت ديسكورد>
+   - HF_API_TOKEN = <توكن Hugging Face مجاني>
+   - MODEL_NAME = bigcode/starcoder
+   - HF_TEMPERATURE = 0.2
+   - HF_MAX_TOKENS = 1024
+   - MAX_HISTORY = 6
+2) اضغط Deploy/Manual Deploy أو Restart وانتظر حتى يبنى.
+3) راجع Logs: لو ظهر "Logged in as ..." يبشر أن البوت متصل.
+
+نصائح لاستخدام البوت لبرمجة أفضل:
+- علشان يطبق وضع الكود استخدم كلمات مثل: "كود"، "بايثون"، أو أضف كتلة كود باستخدام ```
+- للحصول على إجابة برمجية دقيقة، اشرح المطلوب مع مثال صغير أو أخطاء موجودة.
+
+تحذير واقعي:
+- لا يوجد نموذج خارق مجاناً بلا حدود. أفضل تجربة برمجية مجانية هي باستخدام نماذج مفتوحة المصدر مثل StarCoder عبر Hugging Face — تحتاج توكن مجاني فقط.
+- إذا احتجت موارد أكبر أو استجابة أسرع، يلزمك لاحقًا ترقية الاستضافة أو استخدام خدمة مدفوعة.
 
